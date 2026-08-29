@@ -1,0 +1,43 @@
+name: Daily TamilMV Scraper
+
+on:
+  schedule:
+    # Run twice a day at 03:00 UTC and 15:00 UTC
+    - cron: '0 3,15 * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Scraper
+        env:
+          TAMILMV_BASE_URL: ${{ secrets.TAMILMV_BASE_URL || 'https://www.1tamilmv.fi/' }}
+          IMDB_API_KEY: ${{ secrets.IMDB_API_KEY }}
+          MAX_SCRAPE_LIMIT: ${{ secrets.MAX_SCRAPE_LIMIT || '300' }}
+        run: npm run scrape:once
+
+      - name: Commit and push updated data/movies.json
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/movies.json
+          git diff --staged --quiet || git commit -m "chore: auto-update movies.json catalog [skip ci]"
+          git push origin main || echo "Nothing to push or pushed already"

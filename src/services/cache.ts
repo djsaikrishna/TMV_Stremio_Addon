@@ -1,29 +1,47 @@
+import fs from 'fs';
+import path from 'path';
+import axios from 'axios';
 import Redis from 'ioredis';
 import { EnrichedMovie } from '../models/movie';
 import { config } from './config';
 
-export const redis = new Redis(config.redisUrl, {
-  tls: config.redisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
-  family: 0, // Helps with IPv6 resolution for upstash
-  connectTimeout: 5000, // Fail if it takes more than 5 seconds to connect
-  maxRetriesPerRequest: 3, // Don't hang forever
-});
+// Initialize Redis only if REDIS_URL is provided
+export const redis = config.redisUrl
+  ? new Redis(config.redisUrl, {
+      tls: config.redisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
+      family: 0,
+      connectTimeout: 5000,
+      maxRetriesPerRequest: 3,
+    })
+  : null;
+
+if (redis) {
+  let lastLoggedErrorTime = 0;
+  redis.on('error', (err) => {
+    const now = Date.now();
+    if (now - lastLoggedErrorTime > 60000) {
+      console.error('[Redis Error]', err.message);
+      lastLoggedErrorTime = now;
+    }
+  });
+}
 
 const MOVIE_KEY_PREFIX = 'tamilmv:movie:';
 const MOVIE_LIST_KEY = 'tamilmv:movies:list';
-
 export const getMovieKey = (id: string): string => `${MOVIE_KEY_PREFIX}${id}`;
+
+const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DATA_FILE = path.join(DATA_DIR, 'movies.json');
 
 const getExternalId = (movie: EnrichedMovie): string =>
   movie.imdbId || `tamilmv-${movie.id}`;
 
-export async function saveMovies(movies: EnrichedMovie[]): Promise<void> {
-  // eslint-disable-next-line no-console
-  console.log('[Redis] Saving movies count:', movies.length);
+// In-memory data store
+const inMemoryMovies = new Map<string, EnrichedMovie>();
+let inMemoryMovieIds: string[] = [];
+let isInitialized = false;
 
-  const newIds: string[] = [];
-  const setPipeline = redis.pipeline();
-
+function populateInMemoryStore(movies: EnrichedMovie[]): void {
   const movieMap = new Map<string, EnrichedMovie>();
 
   for (const movie of movies) {
@@ -31,11 +49,11 @@ export async function saveMovies(movies: EnrichedMovie[]): Promise<void> {
     if (movieMap.has(id)) {
       const existing = movieMap.get(id)!;
       existing.qualities.push(...movie.qualities);
-      
+
       if (movie.languages) {
         existing.languages = Array.from(new Set([...(existing.languages || []), ...movie.languages]));
       }
-      
+
       if (movie.rawText && existing.rawText !== movie.rawText) {
         existing.rawText += '\n\n' + movie.rawText;
       }
@@ -44,68 +62,249 @@ export async function saveMovies(movies: EnrichedMovie[]): Promise<void> {
     }
   }
 
+  inMemoryMovies.clear();
+  inMemoryMovieIds = [];
+
   for (const [id, mergedMovie] of movieMap.entries()) {
-    newIds.push(id);
-    setPipeline.set(getMovieKey(id), JSON.stringify(mergedMovie));
-  }
-  await setPipeline.exec();
-
-  // Get current list of IDs to identify what needs to be removed
-  const existingIds = await redis.lrange(MOVIE_LIST_KEY, 0, -1);
-
-  // Find IDs that are in the old list but NOT in the new batch
-  const newIdsSet = new Set(newIds);
-  const idsToRemove = existingIds.filter(id => !newIdsSet.has(id));
-
-  // Update the master list: replace entirely with the new 200
-  const updatePipeline = redis.pipeline();
-
-  updatePipeline.del(MOVIE_LIST_KEY);
-  if (newIds.length > 0) {
-    updatePipeline.rpush(MOVIE_LIST_KEY, ...newIds);
+    inMemoryMovieIds.push(id);
+    inMemoryMovies.set(id, mergedMovie);
   }
 
-  // Delete individual movie data for evicted items to keep cache clean
-  if (idsToRemove.length > 0) {
-    const keysToRemove = idsToRemove.map(getMovieKey);
-    // Batch delete in chunks if needed, but for 1500 it's fine
-    updatePipeline.del(...keysToRemove);
+  console.log(`[Cache] In-memory store ready with ${inMemoryMovieIds.length} movies.`);
+}
+
+export async function saveMovies(movies: EnrichedMovie[]): Promise<void> {
+  console.log('[Cache] Saving movies count:', movies.length);
+
+  // 1. Update in-memory store
+  populateInMemoryStore(movies);
+  const allMovies = Array.from(inMemoryMovies.values());
+
+  // 2. Save locally to data/movies.json
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(DATA_FILE, JSON.stringify(allMovies, null, 2), 'utf-8');
+    console.log(`[Cache] Successfully wrote ${allMovies.length} movies to local file: ${DATA_FILE}`);
+  } catch (err: any) {
+    console.error('[Cache] Failed to write local JSON file:', err.message);
   }
 
-  await updatePipeline.exec();
+  // 3. If GitHub Gist is configured, update the remote Gist
+  if (config.gistId && config.githubToken) {
+    try {
+      console.log('[Cache] Uploading movies.json to GitHub Gist...');
+      await axios.patch(
+        `https://api.github.com/gists/${config.gistId}`,
+        {
+          description: `TamilMV Movies Catalog Cache (Updated: ${new Date().toISOString()})`,
+          files: {
+            'movies.json': {
+              content: JSON.stringify(allMovies, null, 2),
+            },
+          },
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${config.githubToken}`,
+            Accept: 'application/vnd.github+json',
+            'User-Agent': 'Stremio-Addon-Tamil',
+          },
+          timeout: 15000,
+        }
+      );
+      console.log(`[Cache] Successfully updated GitHub Gist (${config.gistId})!`);
+    } catch (err: any) {
+      console.error('[Cache] Failed to update GitHub Gist:', err.response?.data || err.message);
+    }
+  }
 
-  // eslint-disable-next-line no-console
-  console.log(`[Redis] Replaced list with ${newIds.length} current movies. Evicted ${idsToRemove.length} obsolete items.`);
+  // 4. Optional: Update Redis if available
+  if (redis) {
+    try {
+      const setPipeline = redis.pipeline();
+      for (const [id, mergedMovie] of inMemoryMovies.entries()) {
+        setPipeline.set(getMovieKey(id), JSON.stringify(mergedMovie));
+      }
+      await setPipeline.exec();
+
+      const existingIds = await redis.lrange(MOVIE_LIST_KEY, 0, -1);
+      const newIdsSet = new Set(inMemoryMovieIds);
+      const idsToRemove = existingIds.filter((id) => !newIdsSet.has(id));
+
+      const updatePipeline = redis.pipeline();
+      updatePipeline.del(MOVIE_LIST_KEY);
+      if (inMemoryMovieIds.length > 0) {
+        updatePipeline.rpush(MOVIE_LIST_KEY, ...inMemoryMovieIds);
+      }
+      if (idsToRemove.length > 0) {
+        const keysToRemove = idsToRemove.map(getMovieKey);
+        updatePipeline.del(...keysToRemove);
+      }
+      await updatePipeline.exec();
+      console.log(`[Redis] Synced ${inMemoryMovieIds.length} movies to Redis.`);
+    } catch (err: any) {
+      console.warn(`[Redis] Failed to sync to Redis (${err.message}). In-memory / file cache is active.`);
+    }
+  }
+}
+
+export async function initCache(): Promise<void> {
+  console.log('[Cache] Initializing cache...');
+
+  // 1. Try fetching from remote Static URL / CDN
+  if (config.dataUrl) {
+    try {
+      console.log(`[Cache] Fetching movies from remote DATA_URL: ${config.dataUrl}`);
+      const fetchUrl = config.dataUrl.includes('?')
+        ? `${config.dataUrl}&_t=${Date.now()}`
+        : `${config.dataUrl}?_t=${Date.now()}`;
+
+      const response = await axios.get(fetchUrl, {
+        timeout: 10000,
+        headers: {
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+          'User-Agent': 'Stremio-Addon-Tamil',
+        },
+      });
+      let data = response.data;
+      if (typeof data === 'string') {
+        data = JSON.parse(data);
+      }
+      if (Array.isArray(data) && data.length > 0) {
+        populateInMemoryStore(data);
+        isInitialized = true;
+        // Also save local copy
+        try {
+          if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+          fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf-8');
+        } catch {
+          // ignore local save error
+        }
+        setupPeriodicRefresh();
+        return;
+      }
+    } catch (err: any) {
+      console.warn(`[Cache] Failed to fetch from DATA_URL (${err.message}). Trying next fallback...`);
+    }
+  }
+
+  // 2. Try fetching from GitHub Gist
+  if (config.gistId) {
+    try {
+      console.log(`[Cache] Fetching movies from GitHub Gist: ${config.gistId}`);
+      const headers: Record<string, string> = {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'Stremio-Addon-Tamil',
+      };
+      if (config.githubToken) {
+        headers.Authorization = `Bearer ${config.githubToken}`;
+      }
+      const response = await axios.get(`https://api.github.com/gists/${config.gistId}`, {
+        headers,
+        timeout: 10000,
+      });
+      const fileContent = response.data?.files?.['movies.json']?.content;
+      if (fileContent) {
+        const data = JSON.parse(fileContent);
+        if (Array.isArray(data) && data.length > 0) {
+          populateInMemoryStore(data);
+          isInitialized = true;
+          setupPeriodicRefresh();
+          return;
+        }
+      }
+    } catch (err: any) {
+      console.warn(`[Cache] Failed to fetch from GitHub Gist (${err.message}). Trying local file...`);
+    }
+  }
+
+  // 3. Try reading local data/movies.json file
+  if (fs.existsSync(DATA_FILE)) {
+    try {
+      console.log(`[Cache] Loading movies from local file: ${DATA_FILE}`);
+      const raw = fs.readFileSync(DATA_FILE, 'utf-8');
+      const data = JSON.parse(raw);
+      if (Array.isArray(data) && data.length > 0) {
+        populateInMemoryStore(data);
+        isInitialized = true;
+        setupPeriodicRefresh();
+        return;
+      }
+    } catch (err: any) {
+      console.warn(`[Cache] Failed to read local JSON file (${err.message}). Trying Redis...`);
+    }
+  }
+
+  // 4. Try loading from Redis as fallback
+  if (redis) {
+    try {
+      const ids = await redis.lrange(MOVIE_LIST_KEY, 0, -1);
+      if (ids && ids.length > 0) {
+        const keys = ids.map(getMovieKey);
+        const raw = await redis.mget(keys);
+        const movies: EnrichedMovie[] = [];
+        raw.forEach((item) => {
+          if (item) movies.push(JSON.parse(item) as EnrichedMovie);
+        });
+        if (movies.length > 0) {
+          populateInMemoryStore(movies);
+          isInitialized = true;
+          setupPeriodicRefresh();
+          return;
+        }
+      }
+    } catch (err: any) {
+      console.warn(`[Cache] Failed to load from Redis (${err.message}).`);
+    }
+  }
+
+  console.log('[Cache] No pre-existing movie data found. Will populate after first scrape.');
+  isInitialized = true;
+  setupPeriodicRefresh();
+}
+
+let refreshIntervalTimer: NodeJS.Timeout | null = null;
+function setupPeriodicRefresh(): void {
+  if (refreshIntervalTimer || (!config.dataUrl && !config.gistId)) return;
+
+  const intervalMs = Math.max(1, config.dataRefreshMinutes) * 60 * 1000;
+  console.log(`[Cache] Periodic remote cache refresh enabled (every ${config.dataRefreshMinutes} minutes).`);
+
+  refreshIntervalTimer = setInterval(() => {
+    console.log('[Cache] Running periodic remote data refresh...');
+    void initCache();
+  }, intervalMs);
 }
 
 export async function listMovieIds(): Promise<string[]> {
-  const ids = await redis.lrange(MOVIE_LIST_KEY, 0, -1);
-  // eslint-disable-next-line no-console
-  console.log('[Redis] listMovieIds -> count:', ids.length);
-  return ids;
+  if (!isInitialized && inMemoryMovieIds.length === 0) {
+    await initCache();
+  }
+  return inMemoryMovieIds;
 }
 
 export async function getMovieById(id: string): Promise<EnrichedMovie | null> {
-  console.log('[Redis] getMovieById -> id:', id);
-  const raw = await redis.get(getMovieKey(id));
-  if (!raw) return null;
-  // eslint-disable-next-line no-console
-  console.log('[Redis] getMovieById -> cache hit for id:', id);
-  return JSON.parse(raw) as EnrichedMovie;
+  if (!isInitialized && inMemoryMovieIds.length === 0) {
+    await initCache();
+  }
+  return inMemoryMovies.get(id) ?? null;
 }
 
 export async function getMoviesByIds(ids: string[]): Promise<EnrichedMovie[]> {
   if (!ids.length) return [];
-  const keys = ids.map(getMovieKey);
-  const raw = await redis.mget(keys);
+  if (!isInitialized && inMemoryMovieIds.length === 0) {
+    await initCache();
+  }
+
   const result: EnrichedMovie[] = [];
-  raw.forEach((item) => {
+  for (const id of ids) {
+    const item = inMemoryMovies.get(id);
     if (item) {
-      result.push(JSON.parse(item) as EnrichedMovie);
+      result.push(item);
     }
-  });
-  // eslint-disable-next-line no-console
-  console.log('[Redis] getMoviesByIds -> requested:', ids.length, 'found:', result.length);
+  }
   return result;
 }
-

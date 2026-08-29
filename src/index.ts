@@ -18,7 +18,7 @@ import { config } from './services/config';
 // export { manifest };
 
 import { runRefreshOnce } from './scheduler/job'; // Import the direct run function
-
+import { initCache } from './services/cache';
 import { getRouter } from 'stremio-addon-sdk';
 import express, { Request, Response } from 'express';
 
@@ -64,6 +64,9 @@ if (EXTERNAL_URL) {
   }, PING_INTERVAL);
   console.log(`[Keep-Alive] Pinging self every 10 minutes at: ${EXTERNAL_URL}`);
 }
+
+// Initialize in-memory cache from remote CDN / Gist / local disk
+void initCache();
 
 app.listen(config.port, () => {
   console.log(`TamilMV Stremio addon running on http://localhost:${config.port}/manifest.json`);
