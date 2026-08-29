@@ -96,24 +96,64 @@ const detectLanguages = (rawText: string): string[] => {
 const makeId = (rawTitle: string, url: string): string =>
   crypto.createHash('md5').update(`${rawTitle.toLowerCase()}-${url}`).digest('hex');
 
-export async function fetchTamilMVHomepageHtml(): Promise<string> {
-  // eslint-disable-next-line no-console
-  console.log('[TamilMV] Fetching homepage:', config.tamilmvBaseUrl);
+const BROWSER_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept':
+    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Cache-Control': 'max-age=0',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  'Sec-Ch-Ua-Mobile': '?0',
+  'Sec-Ch-Ua-Platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+};
 
-  const response = await axios.get(config.tamilmvBaseUrl, {
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36',
-    },
-  });
-  const html = response.data as string;
-  // eslint-disable-next-line no-console
-  console.log('[TamilMV] Homepage length:', html.length);
-  return html;
+const KNOWN_MIRRORS = [
+  config.tamilmvBaseUrl,
+  'https://www.1tamilmv.fi',
+  'https://www.1tamilmv.observer',
+  'https://www.1tamilmv.yt',
+];
+
+let workingBaseUrl = config.tamilmvBaseUrl;
+
+export async function fetchTamilMVHomepageHtml(): Promise<{ html: string; activeBaseUrl: string }> {
+  // Deduplicate mirrors list
+  const mirrors = Array.from(new Set(KNOWN_MIRRORS.map(m => m.replace(/\/+$/, ''))));
+
+  let lastError: any = null;
+  for (const mirror of mirrors) {
+    try {
+      console.log(`[TamilMV] Attempting to fetch homepage from: ${mirror}`);
+      const response = await axios.get(mirror, {
+        headers: BROWSER_HEADERS,
+        timeout: 12000,
+        maxRedirects: 5,
+      });
+
+      const html = response.data as string;
+      if (response.status === 200 && html && html.includes('forums/topic/')) {
+        console.log(`[TamilMV] Successfully fetched homepage from ${mirror} (Length: ${html.length})`);
+        workingBaseUrl = mirror;
+        return { html, activeBaseUrl: mirror };
+      }
+    } catch (err: any) {
+      console.warn(`[TamilMV] Mirror ${mirror} failed (${err.response?.status || err.message}). Trying next mirror...`);
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('All TamilMV mirrors failed to respond.');
 }
 
 export async function scrapeTamilMV(): Promise<ScrapedMovie[]> {
-  const html = await fetchTamilMVHomepageHtml();
+  const { html, activeBaseUrl } = await fetchTamilMVHomepageHtml();
   const movies: ScrapedMovie[] = [];
 
   // 1. Split the raw HTML into layout blocks. 
@@ -136,9 +176,9 @@ export async function scrapeTamilMV(): Promise<ScrapedMovie[]> {
     let pageUrl = linkNode.attr('href');
     if (!pageUrl) continue;
 
-    // Ensure link is absolute
+    // Ensure link is absolute using the active working mirror
     if (!pageUrl.startsWith('http')) {
-      pageUrl = `${config.tamilmvBaseUrl.replace(/\/+$/, '')}/${pageUrl.replace(/^\/+/, '')}`;
+      pageUrl = `${activeBaseUrl.replace(/\/+$/, '')}/${pageUrl.replace(/^\/+/, '')}`;
     }
 
     // Since chunk is isolated, the text is exactly what belongs to this movie
@@ -194,18 +234,34 @@ export async function scrapeTamilMV(): Promise<ScrapedMovie[]> {
   return movies.filter(m => m.qualities && m.qualities.length > 0);
 }
 
-export async function scrapeMoviePageForMagnets(url: string): Promise<ScrapedQuality[]> {
-  try {
-    // eslint-disable-next-line no-console
-    console.log('[TamilMV] Fetching movie page:', url);
-
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36',
-      },
+export async function scrapeMoviePageForMagnets(targetUrl: string): Promise<ScrapedQuality[]> {
+  const tryFetch = async (fetchUrl: string) => {
+    return await axios.get(fetchUrl, {
+      headers: BROWSER_HEADERS,
       timeout: 10000,
+      maxRedirects: 5,
     });
+  };
+
+  try {
+    let response: any;
+    try {
+      response = await tryFetch(targetUrl);
+    } catch (err: any) {
+      // If 403 or network error, attempt to rewrite domain to workingBaseUrl
+      const urlObj = new URL(targetUrl);
+      const activeObj = new URL(workingBaseUrl);
+      if (urlObj.hostname !== activeObj.hostname) {
+        urlObj.hostname = activeObj.hostname;
+        urlObj.protocol = activeObj.protocol;
+        urlObj.port = activeObj.port;
+        const fallbackUrl = urlObj.toString();
+        console.log(`[TamilMV] Retrying movie page with active mirror: ${fallbackUrl}`);
+        response = await tryFetch(fallbackUrl);
+      } else {
+        throw err;
+      }
+    }
 
     const $ = loadHtml(response.data);
     const results: ScrapedQuality[] = [];
@@ -217,22 +273,16 @@ export async function scrapeMoviePageForMagnets(url: string): Promise<ScrapedQua
       if (!href) return;
 
       // STRATEGY 1: Extract quality from the Magnet "dn" (Display Name) parameter
-      // Example dn: "www.1TamilMV.gs - Kshetrapati (2023)... 1080p..."
       const dnMatch = href.match(/dn=([^&]+)/);
       let textToScan =
         dnMatch && dnMatch[1] !== undefined ? decodeURIComponent(dnMatch[1]) : '';
 
       // STRATEGY 2: Fallback to the text of the element immediately before the magnet link
-      // (The structure is usually <br> -> <strong>Description</strong> -> <br> -> Magnet)
       if (!textToScan) {
-        // Look at the previous 3 siblings to find a <strong> tag with text
         const prevText = link.prevAll('strong').first().text();
         textToScan = prevText || link.text();
       }
-      // Get the base 1080p/720p/etc.
       const baseQuality = guessQuality(textToScan) as string;
-
-      // Enhance it with size, codec, and audio details
       const { quality, size } = extractStreamDetails(textToScan, baseQuality);
 
       results.push({
@@ -241,24 +291,12 @@ export async function scrapeMoviePageForMagnets(url: string): Promise<ScrapedQua
         type: 'magnet',
         url: href,
       });
-      // const quality = guessQuality(textToScan) as ScrapedQuality['quality'];
-
-      // // Optional: If you want to capture the file size (e.g. "3.5GB"), you can add a regex for that here.
-
-      // results.push({
-      //   quality,
-      //   type: 'magnet',
-      //   url: href,
-      // });
     });
 
-    // eslint-disable-next-line no-console
-    console.log('[TamilMV] Found magnet links on page:', url, 'count:', results.length);
-
+    console.log('[TamilMV] Found magnet links on page:', targetUrl, 'count:', results.length);
     return results;
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error('[TamilMV] Error fetching movie page:', url, error);
+  } catch (error: any) {
+    console.error(`[TamilMV] Error fetching movie page (${targetUrl}):`, error.response?.status || error.message);
     return [];
   }
 }
