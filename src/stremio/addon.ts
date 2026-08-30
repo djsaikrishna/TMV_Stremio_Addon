@@ -66,7 +66,9 @@ builder.defineCatalogHandler(async (args: any) => {
     poster: m.poster,
     thumbnail: m.thumbnail,
     year: m.year ?? m.yearGuess,
-    genres: m.genres,
+    genres: m.genres && m.genres.length > 0
+      ? Array.from(new Set([...m.genres, ...(m.languages || [])]))
+      : (m.languages || []),
     description: m.description
       ? `${m.description}\n\nOriginal TamilMV Title: ${m.rawText || m.rawTitle}`
       : `Original TamilMV Title: ${m.rawText || m.rawTitle}`,
@@ -204,7 +206,9 @@ builder.defineMetaHandler(async (args: any) => {
           poster: movie.poster,
           background: movie.thumbnail,
           year: movie.year ?? movie.yearGuess,
-          genres: movie.genres,
+          genres: movie.genres && movie.genres.length > 0
+            ? Array.from(new Set([...movie.genres, ...(movie.languages || [])]))
+            : (movie.languages || []),
           description: movie.description
             ? `${movie.description}\n\nOriginal TamilMV Title: ${movie.rawText || movie.rawTitle}`
             : `No IMDB metadata found, but streams are available.\n\nOriginal TamilMV Title: ${movie.rawText || movie.rawTitle}`,

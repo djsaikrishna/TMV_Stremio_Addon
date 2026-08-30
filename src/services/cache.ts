@@ -3,6 +3,7 @@ import path from 'path';
 import axios from 'axios';
 import Redis from 'ioredis';
 import { EnrichedMovie } from '../models/movie';
+import { makeId } from '../scraper/tamilmv';
 import { config } from './config';
 
 // Initialize Redis only if REDIS_URL is provided
@@ -45,20 +46,37 @@ function populateInMemoryStore(movies: EnrichedMovie[]): void {
   const movieMap = new Map<string, EnrichedMovie>();
 
   for (const movie of movies) {
+    if (!movie.imdbId && movie.rawTitle) {
+      movie.id = makeId(movie.rawTitle);
+    }
     const id = getExternalId(movie);
     if (movieMap.has(id)) {
       const existing = movieMap.get(id)!;
-      existing.qualities.push(...movie.qualities);
+      
+      // Merge qualities without duplicate URLs
+      const seenUrls = new Set(existing.qualities.map(q => q.url));
+      for (const q of movie.qualities) {
+        if (!seenUrls.has(q.url)) {
+          seenUrls.add(q.url);
+          existing.qualities.push(q);
+        }
+      }
 
       if (movie.languages) {
         existing.languages = Array.from(new Set([...(existing.languages || []), ...movie.languages]));
+        if (existing.languages.length > 1 && !existing.languages.includes('Multi-Lang')) {
+          existing.languages.push('Multi-Lang');
+        }
       }
 
-      if (movie.rawText && existing.rawText !== movie.rawText) {
-        existing.rawText += '\n\n' + movie.rawText;
+      if (movie.rawText && existing.rawText !== movie.rawText && !existing.rawText?.includes(movie.rawText)) {
+        existing.rawText = (existing.rawText ? existing.rawText + '\n\n' : '') + movie.rawText;
       }
     } else {
-      movieMap.set(id, movie);
+      if (movie.languages && movie.languages.length > 1 && !movie.languages.includes('Multi-Lang')) {
+        movie.languages.push('Multi-Lang');
+      }
+      movieMap.set(id, { ...movie, qualities: [...movie.qualities] });
     }
   }
 
@@ -176,10 +194,11 @@ export async function initCache(): Promise<void> {
       if (Array.isArray(data) && data.length > 0) {
         populateInMemoryStore(data);
         isInitialized = true;
-        // Also save local copy
+        // Also save local deduplicated copy
         try {
           if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-          fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf-8');
+          const allMovies = Array.from(inMemoryMovies.values());
+          fs.writeFileSync(DATA_FILE, JSON.stringify(allMovies, null, 2), 'utf-8');
         } catch {
           // ignore local save error
         }

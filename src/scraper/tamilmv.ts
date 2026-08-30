@@ -58,7 +58,7 @@ const parseTitleAndYear = (
   let titleGuess = rawTitle;
 
   // Clean up the title by taking everything before the year to drop trailing quality tags
-  if (yearMatch && yearMatch.index) {
+  if (yearMatch && yearMatch.index !== undefined) {
     titleGuess = rawTitle.substring(0, yearMatch.index);
   } else {
     // Fallback if no year: split by dash or bracket
@@ -66,7 +66,7 @@ const parseTitleAndYear = (
   }
 
   // Remove trailing parentheses, brackets, or extra spaces
-  titleGuess = titleGuess.replace(/[\(\[\-]/g, '').replace(/\s+/g, ' ').trim();
+  titleGuess = titleGuess.replace(/[\(\[\-\)\]]/g, ' ').replace(/\s+/g, ' ').trim();
 
   return { titleGuess, yearGuess };
 };
@@ -74,11 +74,11 @@ const parseTitleAndYear = (
 const detectLanguages = (rawText: string): string[] => {
   const found: string[] = [];
 
-  if (/Tamil/i.test(rawText)) found.push('Tamil');
-  if (/Malayalam/i.test(rawText)) found.push('Malayalam');
-  if (/Telugu/i.test(rawText)) found.push('Telugu');
-  if (/Kannada|Kanada/i.test(rawText)) found.push('Kannada');
-  if (/Hindi/i.test(rawText)) found.push('Hindi');
+  if (/Tamil|\bTAM\b/i.test(rawText)) found.push('Tamil');
+  if (/Malayalam|\bMAL\b/i.test(rawText)) found.push('Malayalam');
+  if (/Telugu|\bTEL\b|Teugu/i.test(rawText)) found.push('Telugu');
+  if (/Kannada|Kanada|\bKAN\b/i.test(rawText)) found.push('Kannada');
+  if (/Hindi|\bHIN\b/i.test(rawText)) found.push('Hindi');
 
   // If there are multiple languages explicitly mentioned, or "Multi/Dual Audio", categorize as Multi-Lang
   if (/(multi|dual)[\s-]*audio/i.test(rawText)) {
@@ -92,9 +92,9 @@ const detectLanguages = (rawText: string): string[] => {
   return found;
 };
 
-// Use the URL in the hash to ensure different versions (Tamil/Telugu) of the same movie have unique IDs
-const makeId = (rawTitle: string, url: string): string =>
-  crypto.createHash('md5').update(`${rawTitle.toLowerCase()}-${url}`).digest('hex');
+// Deterministic ID based on normalized raw title (independent of topic URL)
+export const makeId = (rawTitle: string): string =>
+  crypto.createHash('md5').update(rawTitle.toLowerCase().trim()).digest('hex');
 
 const BROWSER_HEADERS = {
   'User-Agent':
@@ -152,9 +152,15 @@ export async function fetchTamilMVHomepageHtml(): Promise<{ html: string; active
   throw lastError || new Error('All TamilMV mirrors failed to respond.');
 }
 
+interface TopicTarget {
+  pageUrl: string;
+  languages: string[];
+  rawText: string;
+}
+
 export async function scrapeTamilMV(): Promise<ScrapedMovie[]> {
   const { html, activeBaseUrl } = await fetchTamilMVHomepageHtml();
-  const movies: ScrapedMovie[] = [];
+  const movieMap = new Map<string, { movie: ScrapedMovie; topics: TopicTarget[] }>();
 
   // 1. Split the raw HTML into layout blocks. 
   // By splitting on <br>, <p>, <div>, etc. BEFORE parsing DOM, we prevent multiple movies 
@@ -196,42 +202,85 @@ export async function scrapeTamilMV(): Promise<ScrapedMovie[]> {
     if (!titleGuess) continue;
 
     const rawTitle = `${titleGuess} ${yearGuess ? `(${yearGuess})` : ''}`.trim();
-    const id = makeId(rawTitle, pageUrl);
+    const id = makeId(rawTitle);
+    const topicLangs = detectLanguages(rawText);
 
-    if (!movies.find(m => m.pageUrl === pageUrl)) {
-      movies.push({
-        id,
-        rawTitle,
-        titleGuess,
-        yearGuess,
-        pageUrl,
-        qualities: [],
-        rawText,
-        languages: detectLanguages(rawText),
+    if (movieMap.has(id)) {
+      const entry = movieMap.get(id)!;
+      if (!entry.topics.some(t => t.pageUrl === pageUrl)) {
+        entry.topics.push({ pageUrl, languages: topicLangs, rawText });
+      }
+      if (topicLangs.length > 0) {
+        entry.movie.languages = Array.from(new Set([...(entry.movie.languages || []), ...topicLangs]));
+        if (entry.movie.languages.length > 1 && !entry.movie.languages.includes('Multi-Lang')) {
+          entry.movie.languages.push('Multi-Lang');
+        }
+      }
+      if (rawText && entry.movie.rawText && !entry.movie.rawText.includes(rawText)) {
+        entry.movie.rawText += '\n\n' + rawText;
+      }
+    } else {
+      if (movieMap.size >= config.maxScrapeLimit) {
+        console.log(`[TamilMV] Reached limit of ${config.maxScrapeLimit} movies, stopping scan.`);
+        break;
+      }
+
+      const langs = [...topicLangs];
+      if (langs.length > 1 && !langs.includes('Multi-Lang')) {
+        langs.push('Multi-Lang');
+      }
+
+      movieMap.set(id, {
+        movie: {
+          id,
+          rawTitle,
+          titleGuess,
+          yearGuess,
+          pageUrl,
+          qualities: [],
+          rawText,
+          languages: langs,
+        },
+        topics: [
+          { pageUrl, languages: topicLangs, rawText }
+        ]
       });
-    }
-
-    if (movies.length >= config.maxScrapeLimit) {
-      console.log(`[TamilMV] Reached limit of ${config.maxScrapeLimit} movies, stopping scan.`);
-      break;
     }
   }
 
   // eslint-disable-next-line no-console
-  console.log('[TamilMV] Processing magnets for', movies.length, 'movies');
+  console.log('[TamilMV] Processing magnets for', movieMap.size, 'unique movies');
 
-  for (const movie of movies) {
-    if (movie.pageUrl) {
-      movie.qualities = await scrapeMoviePageForMagnets(movie.pageUrl);
-      // Assign the movie's languages to its individual streams
-      movie.qualities.forEach(q => q.languages = movie.languages);
-      // eslint-disable-next-line no-console
-      console.log(`[TamilMV] Magnets for movie: ${movie.titleGuess} -> ${movie.qualities.length}`);
+  const resultMovies: ScrapedMovie[] = [];
+
+  for (const { movie, topics } of movieMap.values()) {
+    const allQualities: ScrapedQuality[] = [];
+    const seenUrls = new Set<string>();
+
+    for (const topic of topics) {
+      const pageQualities = await scrapeMoviePageForMagnets(topic.pageUrl);
+      for (const q of pageQualities) {
+        // Assign the topic's languages to this stream; fallback to movie languages if topic has none
+        q.languages = topic.languages.length > 0 ? topic.languages : (movie.languages || []);
+
+        if (!seenUrls.has(q.url)) {
+          seenUrls.add(q.url);
+          allQualities.push(q);
+        }
+      }
+    }
+
+    movie.qualities = allQualities;
+    // eslint-disable-next-line no-console
+    console.log(`[TamilMV] Total magnets for movie: ${movie.titleGuess} -> ${movie.qualities.length} (from ${topics.length} topic pages)`);
+
+    if (movie.qualities.length > 0) {
+      resultMovies.push(movie);
     }
   }
 
   // Filter out any entries that ended up having no magnets
-  return movies.filter(m => m.qualities && m.qualities.length > 0);
+  return resultMovies;
 }
 
 export async function scrapeMoviePageForMagnets(targetUrl: string): Promise<ScrapedQuality[]> {
