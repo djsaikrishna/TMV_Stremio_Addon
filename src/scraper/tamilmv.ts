@@ -118,7 +118,7 @@ const KNOWN_MIRRORS = [
   config.tamilmvBaseUrl,
   'https://www.1tamilmv.fi',
   'https://www.1tamilmv.observer',
-  'https://www.1tamilmv.yt',
+  'https://www.1tamilmv.meme',
 ];
 
 let workingBaseUrl = config.tamilmvBaseUrl;
